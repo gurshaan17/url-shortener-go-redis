@@ -2,11 +2,15 @@ package routes
 
 import (
 	"time"
+	"os"
+	"strconv"
+
 	"github.com/gurshaan17/url-shortener-go-redis/database"
 	"github.com/gurshaan17/url-shortener-go-redis/helpers"
 	"github.com/gofiber/fiber/v2"
-	"os"
-	"strconv"
+	"github.com/go-redis/redis/v8"
+	"github.com/asaskevich/govalidator"
+	"github.com/google/uuid"
 )
 
 type request struct {
@@ -29,37 +33,47 @@ func ShortenURL(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "can't parse json"})
 	}
 
-	//implement rate limit & check if input is an actual URL
+	// Implement rate limit & check if input is an actual URL
 	r2 := database.CreateClient(1)
 	defer r2.Close()
+
+	// Get the current rate limit value for the IP
 	val, err := r2.Get(database.Ctx, c.IP()).Result()
-	if err == redis.Nil{ 
-		_ = r2.Set(database.Ctx, c.IP(), os.Getenv("API_QUOTA"), 30*60*time.Second).Err()
+	var valInt int
+	if err == redis.Nil {
+		// If no value exists, set the initial rate limit
+		initialQuota := os.Getenv("API_QUOTA")
+		if initialQuota == "" {
+			initialQuota = "10" // Default value if not set
+		}
+		valInt, _ = strconv.Atoi(initialQuota)
+		_ = r2.Set(database.Ctx, c.IP(), valInt, 30*time.Minute).Err()
+	} else if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "cannot connect to database"})
 	} else {
-		val, _ := r2.Get(database.Ctx, c.IP()).Result()
-		valInt, _ := strconv.Atoi(val)
+		valInt, _ = strconv.Atoi(val)
 		if valInt <= 0 {
 			limit, _ := r2.TTL(database.Ctx, c.IP()).Result()
-			return c.Status(500).JSON(fiber.Map{
-				"error": "rate limit exceeded",
-				"rate_limit_reset": limit / time.Nanosecond / time.Minute,
+			return c.Status(429).JSON(fiber.Map{
+				"error":            "rate limit exceeded",
+				"rate_limit_reset": limit / time.Minute,
 			})
 		}
 	}
-
 
 	if !govalidator.IsURL(body.URL) {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid URL"})
 	}
 
-
-	// check for domain error
+	// Check for domain error
 	if !helpers.RemoveDomainError(body.URL) {
-		return c.Status(503).JSON(fiber.Map{"error": "you can't access it"})
+		return c.Status(503).JSON(fiber.Map{"error": "you can't access this URL"})
 	}
-	// enforce https, ssl
+
+	// Enforce HTTPS, SSL
 	body.URL = helpers.EnforceHTTP(body.URL)
 
+	// Generate ID
 	var id string
 	if body.CustomShort == "" {
 		id = uuid.New().String()[:6]
@@ -69,17 +83,21 @@ func ShortenURL(c *fiber.Ctx) error {
 
 	r := database.CreateClient(0)
 	defer r.Close()
+
+	// Check if the custom short ID is already in use
 	val, _ = r.Get(database.Ctx, id).Result()
 	if val != "" {
 		return c.Status(403).JSON(fiber.Map{
-			"error": "URL Custom short is already in use",
+			"error": "Custom short URL is already in use",
 		})
 	}
 
+	// Set expiry time to default 24 hours if not provided
 	if body.Expiry == 0 {
 		body.Expiry = 24
 	}
 
+	// Set the URL in the Redis database with the specified expiry
 	err = r.Set(database.Ctx, id, body.URL, body.Expiry*3600*time.Second).Err()
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{
@@ -87,22 +105,23 @@ func ShortenURL(c *fiber.Ctx) error {
 		})
 	}
 
+	// Prepare the response
 	resp := response{
-		URL: 				body.URL,
-		CustomShort:        "",
-		Expiry:  			body.Expiry,
-		XRateLimiting: 	    10,
-		XRateLimitReset: 	30,
+		URL:             body.URL,
+		CustomShort:     os.Getenv("DOMAIN") + "/" + id,
+		Expiry:          body.Expiry,
+		XRateLimiting:   valInt,
+		XRateLimitReset: 30,
 	}
 
+	// Decrement the rate limit after processing the request
 	r2.Decr(database.Ctx, c.IP())
 
-	val, _ := r2.Get(database.Ctx, c.IP()).Result()
-	resp.RateRemaining, _ := strconv.Atoi(val)
-
+	// Update the response with the current rate limit and reset time
+	val, _ = r2.Get(database.Ctx, c.IP()).Result()
+	resp.XRateLimiting, _ = strconv.Atoi(val)
 	ttl, _ := r2.TTL(database.Ctx, c.IP()).Result()
-	resp.XRateLimitReset = ttl / time.Nanosecond / time.Minute
-	resp.CustomShort = os.Getenv("DOMAIN") + "/" + id
+	resp.XRateLimitReset = ttl / time.Minute
 
 	return c.Status(200).JSON(resp)
 }
